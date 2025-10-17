@@ -7,7 +7,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Repos.Shared;
 using Services.Interfaces;
 using Services.Tables;
-using System;
 
 namespace FinappDiscord;
 
@@ -59,13 +58,15 @@ internal class Program
         // Now boot the Discord bot
         await StartDiscordAsync();
     }
-
     private static async Task StartDiscordAsync()
     {
-        var token = _config["Discord:Token"] ?? throw new InvalidOperationException("Discord token missing");
-        var channelId = ulong.Parse(_config["Discord:ChannelId"] ?? throw new InvalidOperationException("Channel ID missing"));
+        var token = _config?["Discord:Token"] ?? throw new InvalidOperationException("Discord token missing");
 
-        _client = new DiscordSocketClient();
+        _client = new DiscordSocketClient(new DiscordSocketConfig
+        {
+            GatewayIntents = GatewayIntents.AllUnprivileged
+        });
+
         _client.Log += msg => { Console.WriteLine(msg); return Task.CompletedTask; };
 
         await _client.LoginAsync(TokenType.Bot, token);
@@ -75,23 +76,52 @@ internal class Program
         {
             Console.WriteLine("🤖 Bot is online!");
 
-            if (_client.GetChannel(channelId) is IMessageChannel channel)
-            {
-                await channel.SendMessageAsync("👋 Hello from FinappDiscord (with Finapp.Core loaded)!");
-                Console.WriteLine("✅ Message sent successfully.");
+            // Register the slash command (if not already registered)
+            var globalCommand = new SlashCommandBuilder()
+                .WithName("car")
+                .WithDescription("Car-related commands")
+                .AddOption(new SlashCommandOptionBuilder()
+                    .WithName("count")
+                    .WithDescription("Get total number of cars")
+                    .WithType(ApplicationCommandOptionType.SubCommand));
 
-                // Example: resolve a Finapp service and use it
-                using var scope = _services!.CreateScope();
-                var carSvc = scope.ServiceProvider.GetRequiredService<ICarSvc>();
-                var cars = await carSvc.FetchTotalCount();
-                await channel.SendMessageAsync($"🚗 There are currently {cars} cars in the Finapp DB!");
-            }
-            else
+            try
             {
-                Console.WriteLine("⚠️ Couldn't find channel — check the ID and permissions.");
+                await _client.CreateGlobalApplicationCommandAsync(globalCommand.Build());
+                Console.WriteLine("✅ Registered /car command globally.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Command registration failed: {ex.Message}");
             }
         };
 
+        // Handle the command when it’s used
+        _client.SlashCommandExecuted += HandleSlashCommandAsync;
+
         await Task.Delay(-1);
+    }
+
+    private static async Task HandleSlashCommandAsync(SocketSlashCommand command)
+    {
+        if (command.Data.Name == "car")
+        {
+            var subCommand = command.Data.Options.FirstOrDefault()?.Name;
+
+            if (subCommand == "count")
+            {
+                await command.DeferAsync(); // optional, shows "thinking..."
+
+                using var scope = _services!.CreateScope();
+                var carSvc = scope.ServiceProvider.GetRequiredService<ICarSvc>();
+                var count = await carSvc.FetchTotalCount();
+
+                await command.FollowupAsync($"🚗 There are currently **{count}** cars in the Finapp database!");
+            }
+            else
+            {
+                await command.RespondAsync("⚠️ Unknown car subcommand.");
+            }
+        }
     }
 }
