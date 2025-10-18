@@ -7,6 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Repos.Shared;
 using Services.Interfaces;
 using Services.Tables;
+using System.Reflection;
 
 namespace FinappDiscord;
 
@@ -15,6 +16,19 @@ internal class Program
     private static DiscordSocketClient? _client;
     private static IServiceProvider? _services;
     private static IConfiguration? _config;
+
+    // Map command names to service types
+    private static readonly Dictionary<string, Type> ServiceMap = new()
+    {
+        { "car", typeof(ICarSvc) },
+        { "budget", typeof(IBudgetSvc) },
+        { "paycheck", typeof(IPaycheckSvc) },
+        { "investment", typeof(IInvestmentSvc) },
+        { "sidegig", typeof(ISideGigSvc) },
+        { "housing", typeof(IHousingSvc) },
+        { "contribution", typeof(IContributionSvc) },
+        { "transaction", typeof(ITransactionSvc) },
+    };
 
     private static async Task Main()
     {
@@ -29,7 +43,7 @@ internal class Program
         // Setup DI container
         var services = new ServiceCollection();
 
-        // Register DbContext (same as in Finapp.API)
+        // Register DbContext
         services.AddDbContext<AppDbContext>(options =>
             options.UseNpgsql(
                 _config.GetConnectionString("Finapp"),
@@ -37,7 +51,7 @@ internal class Program
             )
         );
 
-        // Register all your Finapp.Core services
+        // Register Finapp.Core services
         services.AddScoped<IBudgetSvc, BudgetSvc>();
         services.AddScoped<ISideGigSvc, SideGigSvc>();
         services.AddScoped<IHousingSvc, HousingSvc>();
@@ -50,14 +64,15 @@ internal class Program
         services.AddScoped<CommonRepo>();
         services.AddScoped<DateRepo>();
 
-        // Build the DI container
+        // Build DI container
         _services = services.BuildServiceProvider();
 
         Console.WriteLine("✅ Finapp.Core services initialized.");
 
-        // Now boot the Discord bot
+        // Start the Discord bot
         await StartDiscordAsync();
     }
+
     private static async Task StartDiscordAsync()
     {
         var token = _config?["Discord:Token"] ?? throw new InvalidOperationException("Discord token missing");
@@ -76,19 +91,26 @@ internal class Program
         {
             Console.WriteLine("🤖 Bot is online!");
 
-            // Register the slash command (if not already registered)
-            var globalCommand = new SlashCommandBuilder()
-                .WithName("car")
-                .WithDescription("Car-related commands")
-                .AddOption(new SlashCommandOptionBuilder()
-                    .WithName("count")
-                    .WithDescription("Get total number of cars")
-                    .WithType(ApplicationCommandOptionType.SubCommand));
+            // Dynamically register a global slash command for each service
+            var commands = ServiceMap.Keys.Select(serviceName =>
+                new SlashCommandBuilder()
+                    .WithName(serviceName)
+                    .WithDescription($"{serviceName}-related commands")
+                    .AddOption(new SlashCommandOptionBuilder()
+                        .WithName("count")
+                        .WithDescription($"Get total number of {serviceName} entries")
+                        .WithType(ApplicationCommandOptionType.SubCommand))
+                    .Build()
+            ).ToList();
 
             try
             {
-                await _client.CreateGlobalApplicationCommandAsync(globalCommand.Build());
-                Console.WriteLine("✅ Registered /car command globally.");
+                foreach (var cmd in commands)
+                {
+                    await _client.CreateGlobalApplicationCommandAsync(cmd);
+                }
+
+                Console.WriteLine($"✅ Registered {commands.Count} commands globally.");
             }
             catch (Exception ex)
             {
@@ -96,7 +118,6 @@ internal class Program
             }
         };
 
-        // Handle the command when it’s used
         _client.SlashCommandExecuted += HandleSlashCommandAsync;
 
         await Task.Delay(-1);
@@ -104,24 +125,33 @@ internal class Program
 
     private static async Task HandleSlashCommandAsync(SocketSlashCommand command)
     {
-        if (command.Data.Name == "car")
+        var commandName = command.Data.Name; // e.g. "car", "budget"
+        var subCommand = command.Data.Options.FirstOrDefault()?.Name;
+
+        if (subCommand == "count" && ServiceMap.TryGetValue(commandName, out var serviceType))
         {
-            var subCommand = command.Data.Options.FirstOrDefault()?.Name;
+            await command.DeferAsync(); // shows "thinking..."
 
-            if (subCommand == "count")
+            using var scope = _services!.CreateScope();
+            var service = scope.ServiceProvider.GetRequiredService(serviceType);
+
+            // Use reflection to call FetchTotalCount()
+            var method = serviceType.GetMethod("FetchTotalCount", BindingFlags.Public | BindingFlags.Instance);
+            if (method != null)
             {
-                await command.DeferAsync(); // optional, shows "thinking..."
+                var resultTask = (Task<int>)method.Invoke(service, null)!;
+                var count = await resultTask;
 
-                using var scope = _services!.CreateScope();
-                var carSvc = scope.ServiceProvider.GetRequiredService<ICarSvc>();
-                var count = await carSvc.FetchTotalCount();
-
-                await command.FollowupAsync($"🚗 There are currently **{count}** cars in the Finapp database!");
+                await command.FollowupAsync($"📊 There are currently **{count}** {commandName} records in Finapp!");
             }
             else
             {
-                await command.RespondAsync("⚠️ Unknown car subcommand.");
+                await command.FollowupAsync($"⚠️ `{commandName}` does not implement FetchTotalCount().");
             }
+        }
+        else
+        {
+            await command.RespondAsync($"⚠️ Unknown command `{command.Data.Name}` or subcommand `{subCommand}`.");
         }
     }
 }
